@@ -217,3 +217,52 @@ O,HASH-251,RND8-4-566
   (`None` = `X`), NAND semantics: any `0` input ⇒ `1`; both `1` ⇒ `0`; else `X`.
 - `Node` fields: `.type` (`'C'|'N'|'O'`), `.id`, and `.value` (C) / `.inputs` tuple (N) /
   `.input` (O).
+
+---
+
+## 8. Optimizer — implementation status & results
+
+The base circuit is **395,009 nodes (392,448 NAND)**. Optimization is sound (every
+transform preserves the boolean function; results are verified by random-vector
+equivalence + the `hashlib` battery, and FRAIG merges are individually SAT-proven).
+
+| Pass | NAND | vs base | Notes |
+|------|-----:|--------:|-------|
+| baseline (strash) | 253,620 | −35.4% | structural hashing = constant fold + CSE + dead-cone; all 2,305 constants fold away |
+| + FRAIG (Phase 2) | 239,780 | −38.9% | 11,856 SAT-proven functional merges (incl. ~3,950 functionally-constant nodes) |
+
+**Soundness of FRAIG.** Simulation alone is *unsound* — two nodes can agree on
+thousands of random vectors yet differ on rare inputs (an early sim-only merge
+diverged at vector 809; the gate caught it). So simulation only *proposes*
+candidates; each is *confirmed* by a `pysat` node-pair miter (equivalent ⇔ both
+differing assignments UNSAT) before merging. Nothing is merged without a proof.
+
+**Partial evaluation** (`--pin`) folds pinned inputs to constants and re-runs
+strash, collapsing whole cones. Fully pinning a message → constant outputs equal
+to its digest; pinning only a fixed-length message's padding (`make-pin.py pad N`)
+specializes the circuit (e.g. a 3-byte message → 230,353 NAND, −41.3%, still
+computing correct SHA-256 over the 24 free bits).
+
+**Tools:** `optimize-graph.py <in> <out> [--pin FILE ...] [--vectors N] [--seed S]`;
+`make-pin.py {message <text>|pad <nbytes>} [out]`; `sim.py <a> <b> [N]` (fast
+bit-parallel equivalence). The optimizer is deterministic (same input ⇒ byte-
+identical output).
+
+**Why ~239k and not lower:** the cost is dominated by ~19,200 modular adders,
+which are already near-optimal in the AND-only AIG after strash+FRAIG. Pushing
+substantially lower needs the higher-complexity passes below.
+
+**Roadmap (future work, ordered by ROI/risk):**
+- **XAIG** — first-class XOR/MAJ nodes + optimal XOR3/MAJ3/MUX NAND lowering
+  (recognizes that `Ch` is a MUX, adder sum is XOR3, carry is MAJ3); reduces both
+  representation size and the lowered NAND count for the adder/`Ch`/`Maj` logic.
+- **GF(2)-linear (P-LIN)** — collapse the pure-XOR Σ/σ/schedule cones to parity
+  sets and re-synthesize a shared minimal XOR network (Boyar–Peralta-style).
+- **CSA** — carry-save re-synthesis of the multi-operand adds (depth, and exposes
+  shared compressor cells).
+- **NPN-4 cut rewriting** — curated optimal subgraphs for recurring 4-input cuts
+  (sound via exact local truth tables); a polisher for residual local slack.
+- **Outer driver** — fixpoint loop + wall-clock budget + checkpoint/resume +
+  randomized local search (lets a run be continued for a bigger result later).
+- **Depth balancing** — size-preserving; balance *associative* XOR/AND trees only
+  (carry ripples are not associative). Improves graph explorability for the UI.
