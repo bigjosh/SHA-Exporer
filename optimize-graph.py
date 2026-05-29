@@ -29,10 +29,11 @@ Usage:
 
 from __future__ import annotations
 
-import random
+import argparse
 import sys
 
 import nodes
+import sim
 
 # Literal encoding: lit = (node_index << 1) | complement_bit.
 # Node 0 is the constant node:  lit 0 = const 0,  lit 1 = const 1.
@@ -211,21 +212,24 @@ def optimize(g: nodes.Graph) -> nodes.Graph:
     return lower(aig, outputs)
 
 
-def _quick_equiv_check(g_in: nodes.Graph, g_out: nodes.Graph, k: int = 16,
-                       seed: int = 1234) -> bool:
-    """Fast sanity check: random input vectors must produce identical outputs."""
-    free = sorted(g_in.free_inputs())
-    out_ids = sorted(n.id for n in g_in.outputs())
-    rng = random.Random(seed)
-    for _ in range(k):
-        pi = {f: rng.randint(0, 1) for f in free}
-        va = nodes.evaluate(g_in, pi)
-        vb = nodes.evaluate(g_out, pi)
-        for oid in out_ids:
-            if va[oid] != vb[oid]:
-                print(f"  EQUIV FAIL at {oid}: {va[oid]} != {vb[oid]}")
-                return False
-    return True
+def merge_pins(g: nodes.Graph, pin_paths: list[str]) -> int:
+    """Add constant definitions from pin files into g (partial evaluation).
+
+    A pin file is a .nodes file of `C,<id>,<0|1>` lines that pin otherwise-free
+    inputs (e.g. MESSAGE-*). They are added as constant nodes; strash then folds
+    the now-constant cones during optimize(). g.add raises if a pin collides with
+    an already-defined node (intentional). Returns the number of pins added.
+    """
+    n = 0
+    for path in pin_paths:
+        pg = nodes.parse(path)
+        for node in pg.nodes.values():
+            if node.type != "C":
+                raise ValueError(f"pin file {path} may only contain C nodes; "
+                                 f"got {node.type} for {node.id}")
+            g.add(node)
+            n += 1
+    return n
 
 
 def _stats(g: nodes.Graph) -> str:
@@ -236,12 +240,22 @@ def _stats(g: nodes.Graph) -> str:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print(__doc__)
-        return 2
-    in_path, out_path = argv[1], argv[2]
-    g = nodes.parse(in_path)
+    p = argparse.ArgumentParser(description="Minimize a NAND/C/O circuit via an AIG.")
+    p.add_argument("input")
+    p.add_argument("output")
+    p.add_argument("--pin", action="append", default=[], metavar="FILE",
+                   help="pin free inputs to constants (partial evaluation); repeatable")
+    p.add_argument("--vectors", type=int, default=4096,
+                   help="random vectors for the equivalence gate (default 4096)")
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args(argv[1:])
+
+    g = nodes.parse(args.input)
+    if args.pin:
+        n_pins = merge_pins(g, args.pin)
+        print(f"pinned {n_pins} free inputs to constants")
     print(f"input:  {_stats(g)}")
+
     g_out = optimize(g)
     print(f"output: {_stats(g_out)}")
     n_in = sum(1 for n in g.nodes.values() if n.type == "N")
@@ -249,13 +263,18 @@ def main(argv: list[str]) -> int:
     if n_in:
         print(f"NAND reduction: {n_in} -> {n_out} "
               f"({100 * (n_in - n_out) / n_in:.1f}% fewer)")
-    print("quick equivalence check (16 random vectors)...", end=" ")
-    ok = _quick_equiv_check(g, g_out)
-    print("PASS" if ok else "FAIL")
+
+    # Equivalence gate: the input graph (already specialized with any pins) must
+    # match the output over many random vectors. sim.equivalence requires both
+    # graphs to share the same free-input set, which holds because pins were
+    # merged into g before optimizing.
+    print(f"equivalence gate ({args.vectors} random vectors)...", end=" ")
+    ok, msg = sim.equivalence(g, g_out, args.vectors, seed=args.seed)
+    print("PASS" if ok else f"FAIL — {msg}")
     if not ok:
         return 1
-    g_out.write(out_path)
-    print(f"wrote {out_path}")
+    g_out.write(args.output)
+    print(f"wrote {args.output}")
     return 0
 
 

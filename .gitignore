@@ -6,6 +6,7 @@ __pycache__/
 *.nodes
 *.nodes.mutated
 *.check.nodes
+*.pin
 
 # Claude session breadcrumb (machine/session-specific; read by the pre-commit hook)
 .claude-session-path
