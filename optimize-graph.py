@@ -31,6 +31,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import defaultdict
+
+import numpy as np
 
 import nodes
 import sim
@@ -128,13 +131,9 @@ def build_aig(g: nodes.Graph) -> tuple[Aig, list[tuple[str, int]]]:
     return aig, outputs
 
 
-def lower(aig: Aig, outputs: list[tuple[str, int]]) -> nodes.Graph:
-    """Lower the AIG back to a NAND/C/O graph, emitting only nodes reachable
-    from the outputs."""
-    out = nodes.Graph()
-
-    # Reachable AND nodes (from output literals, backward over fanins).
-    reachable: set[int] = set()
+def reachable_ands(aig: Aig, outputs: list[tuple[str, int]]) -> set[int]:
+    """Indices of AND nodes reachable from the output literals."""
+    reach: set[int] = set()
     stack: list[int] = []
     for _, l in outputs:
         idx = l >> 1
@@ -142,13 +141,158 @@ def lower(aig: Aig, outputs: list[tuple[str, int]]) -> nodes.Graph:
             stack.append(idx)
     while stack:
         idx = stack.pop()
-        if idx in reachable:
+        if idx in reach:
             continue
-        reachable.add(idx)
+        reach.add(idx)
         for fl in (aig.fanin0[idx], aig.fanin1[idx]):
             fi = fl >> 1
-            if fi != 0 and not aig.is_pi[fi] and fi not in reachable:
+            if fi != 0 and not aig.is_pi[fi] and fi not in reach:
                 stack.append(fi)
+    return reach
+
+
+def aig_simulate(aig: Aig, n_words: int, seed: int) -> np.ndarray:
+    """Bit-parallel sim of every AIG node: returns sig[node] = (n_words,) uint64.
+    PIs get random words; node 0 (const 0) stays all-zero."""
+    n = len(aig.fanin0)
+    sig = np.zeros((n, n_words), dtype=np.uint64)
+    rng = np.random.default_rng(seed)
+    f0, f1, ispi = aig.fanin0, aig.fanin1, aig.is_pi
+    for i in range(n):
+        if ispi[i]:
+            sig[i] = np.frombuffer(rng.bytes(n_words * 8), dtype=np.uint64)
+    for i in range(1, n):
+        if ispi[i]:
+            continue
+        a, b = f0[i], f1[i]
+        sa = sig[a >> 1]
+        if a & 1:
+            sa = np.invert(sa)
+        sb = sig[b >> 1]
+        if b & 1:
+            sb = np.invert(sb)
+        sig[i] = sa & sb
+    return sig
+
+
+def _encode_cnf(aig: Aig, reach: set[int]):
+    """Tseitin-encode the reachable AND cone into a fresh incremental SAT solver.
+    SAT var (i+1) holds the boolean value of AIG node i; const node 0 forced false.
+    Returns the solver (caller must .delete() it)."""
+    from pysat.solvers import Cadical153
+    s = Cadical153()
+
+    def satlit(l: int) -> int:
+        node = l >> 1
+        return (node + 1) if (l & 1) == 0 else -(node + 1)
+
+    s.add_clause([-1])  # node 0 (const 0) is false
+    for i in sorted(reach):
+        a, b = aig.fanin0[i], aig.fanin1[i]
+        la, lb, vi = satlit(a), satlit(b), i + 1
+        s.add_clause([-vi, la])
+        s.add_clause([-vi, lb])
+        s.add_clause([-la, -lb, vi])
+    return s
+
+
+def fraig(aig: Aig, outputs: list[tuple[str, int]], n_words: int = 16,
+          seed_a: int = 12345, seed_b: int = 67890, use_sat: bool = True
+          ) -> tuple[Aig, list[tuple[str, int]], int]:
+    """One round of functional merging (FRAIG).
+
+    Simulation PROPOSES merges (nodes with identical canonical signatures over an
+    independent two-seed check); SAT then CONFIRMS each one soundly (a node-pair
+    miter: equivalent iff both differing assignments are UNSAT). Simulation alone
+    is unsound — two nodes can agree on thousands of vectors yet differ on rare
+    inputs — so nothing is merged without a SAT proof. Confirmed nodes are merged
+    into the lowest-index representative (possibly the constant or a PI) by
+    rebuilding through strash, which re-canonicalizes and cascades (e.g. XOR with
+    a now-constant input collapses). PIs are always preserved (interface).
+    Returns (new_aig, new_outputs, merged)."""
+    reach = reachable_ands(aig, outputs)
+    n = len(aig.fanin0)
+    one = np.uint64(1)
+
+    sig = aig_simulate(aig, n_words, seed_a)
+    cand = [0]
+    for i in range(1, n):
+        if aig.is_pi[i] or i in reach:
+            cand.append(i)
+    buckets: dict[bytes, list[int]] = defaultdict(list)
+    for i in cand:  # increasing index -> member lists stay sorted
+        s = sig[i]
+        canon = np.invert(s) if (s[0] & one) else s
+        buckets[canon.tobytes()].append(i)
+
+    def pol(s: np.ndarray) -> bool:
+        return bool(s[0] & one)
+
+    sig2 = aig_simulate(aig, n_words, seed_b)
+    proposed: list[tuple[int, int, bool]] = []  # (rep, member, rel polarity)
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        rep = members[0]
+        prep1 = pol(sig[rep])
+        srep2 = sig2[rep]
+        nsrep2 = np.invert(srep2)
+        for m in members[1:]:
+            if aig.is_pi[m]:
+                continue  # never merge away a free input
+            rel = pol(sig[m]) ^ prep1            # m == rep ^ rel  (per seed_a)
+            target = nsrep2 if rel else srep2
+            if np.array_equal(sig2[m], target):  # survive the independent set
+                proposed.append((rep, m, rel))
+    if not proposed:
+        return aig, outputs, 0
+
+    if use_sat:
+        solver = _encode_cnf(aig, reach)
+
+        def equiv(rep: int, m: int, rel: bool) -> bool:
+            vr, vm = rep + 1, m + 1
+            if not rel:  # rep == m : both differing assignments must be UNSAT
+                if solver.solve(assumptions=[vr, -vm]):
+                    return False
+                if solver.solve(assumptions=[-vr, vm]):
+                    return False
+            else:        # rep == ~m
+                if solver.solve(assumptions=[vr, vm]):
+                    return False
+                if solver.solve(assumptions=[-vr, -vm]):
+                    return False
+            return True
+
+        merge = {m: (rep, rel) for (rep, m, rel) in proposed if equiv(rep, m, rel)}
+        solver.delete()
+    else:
+        merge = {m: (rep, rel) for (rep, m, rel) in proposed}
+    if not merge:
+        return aig, outputs, 0
+
+    new = Aig()
+    new_lit = [0] * n  # new literal for each old node index
+    for i in range(1, n):
+        if aig.is_pi[i]:
+            new_lit[i] = new.pi(aig.pi_name[i])
+        elif i in merge:
+            rep, rel = merge[i]
+            new_lit[i] = new_lit[rep] ^ (1 if rel else 0)
+        elif i in reach:
+            a, b = aig.fanin0[i], aig.fanin1[i]
+            new_lit[i] = new.AND(new_lit[a >> 1] ^ (a & 1),
+                                 new_lit[b >> 1] ^ (b & 1))
+        # dead nodes keep new_lit 0 (never referenced)
+    new_outputs = [(oid, new_lit[l >> 1] ^ (l & 1)) for oid, l in outputs]
+    return new, new_outputs, len(merge)
+
+
+def lower(aig: Aig, outputs: list[tuple[str, int]]) -> nodes.Graph:
+    """Lower the AIG back to a NAND/C/O graph, emitting only nodes reachable
+    from the outputs."""
+    out = nodes.Graph()
+    reachable = reachable_ands(aig, outputs)
 
     const_id: dict[int, str] = {}
     and_neg: dict[int, str] = {}  # idx -> id computing ~AND (the NAND output)
@@ -207,8 +351,22 @@ def lower(aig: Aig, outputs: list[tuple[str, int]]) -> nodes.Graph:
     return out
 
 
-def optimize(g: nodes.Graph) -> nodes.Graph:
+def optimize(g: nodes.Graph, fraig_rounds: int = 8, verbose: bool = True) -> nodes.Graph:
     aig, outputs = build_aig(g)
+    if verbose:
+        print(f"  strash: {aig.num_and} AND nodes "
+              f"({len(reachable_ands(aig, outputs))} reachable)")
+    total_merged = 0
+    for r in range(fraig_rounds):
+        aig, outputs, merged = fraig(aig, outputs)
+        total_merged += merged
+        if verbose and merged:
+            print(f"  fraig round {r + 1}: merged {merged} "
+                  f"({len(reachable_ands(aig, outputs))} reachable ANDs)")
+        if merged == 0:
+            break
+    if verbose:
+        print(f"  fraig total merged: {total_merged}")
     return lower(aig, outputs)
 
 
