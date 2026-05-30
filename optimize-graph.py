@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -42,6 +43,13 @@ import sim
 # Node 0 is the constant node:  lit 0 = const 0,  lit 1 = const 1.
 CONST0 = 0
 CONST1 = 1
+
+# Wall-clock cap on the whole FRAIG SAT-confirm phase (checked between miters) —
+# a safety net for the easy-but-many case. Note: partial evaluation (--pin) skips
+# FRAIG by default, because pinning can create a single hard miter and Cadical
+# (fast, but pysat cannot bound it mid-solve) would grind on it indefinitely;
+# strash already captures most of the pinned gain.
+SAT_PHASE_TIME_S = 1800
 
 
 class Aig:
@@ -180,7 +188,7 @@ def _encode_cnf(aig: Aig, reach: set[int]):
     SAT var (i+1) holds the boolean value of AIG node i; const node 0 forced false.
     Returns the solver (caller must .delete() it)."""
     from pysat.solvers import Cadical153
-    s = Cadical153()
+    s = Cadical153()  # fast incremental solving on the large shared CNF
 
     def satlit(l: int) -> int:
         node = l >> 1
@@ -197,7 +205,8 @@ def _encode_cnf(aig: Aig, reach: set[int]):
 
 
 def fraig(aig: Aig, outputs: list[tuple[str, int]], n_words: int = 16,
-          seed_a: int = 12345, seed_b: int = 67890, use_sat: bool = True
+          seed_a: int = 12345, seed_b: int = 67890, use_sat: bool = True,
+          verbose: bool = False
           ) -> tuple[Aig, list[tuple[str, int]], int]:
     """One round of functional merging (FRAIG).
 
@@ -249,22 +258,37 @@ def fraig(aig: Aig, outputs: list[tuple[str, int]], n_words: int = 16,
 
     if use_sat:
         solver = _encode_cnf(aig, reach)
+        if verbose:
+            print(f"  fraig: SAT-confirming {len(proposed)} candidates...", flush=True)
 
         def equiv(rep: int, m: int, rel: bool) -> bool:
+            # Both nodes must be constrained in the CNF (const0, a PI, or a
+            # reachable AND); an unconstrained dead node would make UNSAT unsound.
+            assert rep == 0 or aig.is_pi[rep] or rep in reach
+            assert m in reach
             vr, vm = rep + 1, m + 1
-            if not rel:  # rep == m : both differing assignments must be UNSAT
-                if solver.solve(assumptions=[vr, -vm]):
+            pairs = [(vr, -vm), (-vr, vm)] if not rel else [(vr, vm), (-vr, -vm)]
+            for assum in pairs:
+                if solver.solve(assumptions=list(assum)):  # SAT -> can differ
                     return False
-                if solver.solve(assumptions=[-vr, vm]):
-                    return False
-            else:        # rep == ~m
-                if solver.solve(assumptions=[vr, vm]):
-                    return False
-                if solver.solve(assumptions=[-vr, -vm]):
-                    return False
-            return True
+            return True  # both halves UNSAT -> proven equivalent
 
-        merge = {m: (rep, rel) for (rep, m, rel) in proposed if equiv(rep, m, rel)}
+        merge = {}
+        t0 = last = time.time()
+        for k, (rep, m, rel) in enumerate(proposed):
+            if time.time() - t0 > SAT_PHASE_TIME_S:
+                if verbose:
+                    print(f"  fraig: SAT phase time cap ({SAT_PHASE_TIME_S}s) hit at "
+                          f"{k}/{len(proposed)}; proceeding with {len(merge)} confirmed",
+                          flush=True)
+                break
+            if equiv(rep, m, rel):
+                merge[m] = (rep, rel)
+            now = time.time()
+            if verbose and now - last >= 60:
+                print(f"    SAT progress: {k + 1}/{len(proposed)} checked, "
+                      f"{len(merge)} confirmed, {now - t0:.0f}s elapsed", flush=True)
+                last = now
         solver.delete()
     else:
         merge = {m: (rep, rel) for (rep, m, rel) in proposed}
@@ -355,18 +379,18 @@ def optimize(g: nodes.Graph, fraig_rounds: int = 8, verbose: bool = True) -> nod
     aig, outputs = build_aig(g)
     if verbose:
         print(f"  strash: {aig.num_and} AND nodes "
-              f"({len(reachable_ands(aig, outputs))} reachable)")
+              f"({len(reachable_ands(aig, outputs))} reachable)", flush=True)
     total_merged = 0
     for r in range(fraig_rounds):
-        aig, outputs, merged = fraig(aig, outputs)
+        aig, outputs, merged = fraig(aig, outputs, verbose=verbose)
         total_merged += merged
         if verbose and merged:
             print(f"  fraig round {r + 1}: merged {merged} "
-                  f"({len(reachable_ands(aig, outputs))} reachable ANDs)")
+                  f"({len(reachable_ands(aig, outputs))} reachable ANDs)", flush=True)
         if merged == 0:
             break
     if verbose:
-        print(f"  fraig total merged: {total_merged}")
+        print(f"  fraig total merged: {total_merged}", flush=True)
     return lower(aig, outputs)
 
 
@@ -378,7 +402,7 @@ def merge_pins(g: nodes.Graph, pin_paths: list[str]) -> int:
     the now-constant cones during optimize(). g.add raises if a pin collides with
     an already-defined node (intentional). Returns the number of pins added.
     """
-    n = 0
+    pinned: list[str] = []
     for path in pin_paths:
         pg = nodes.parse(path)
         for node in pg.nodes.values():
@@ -386,8 +410,13 @@ def merge_pins(g: nodes.Graph, pin_paths: list[str]) -> int:
                 raise ValueError(f"pin file {path} may only contain C nodes; "
                                  f"got {node.type} for {node.id}")
             g.add(node)
-            n += 1
-    return n
+            pinned.append(node.id)
+    referenced = g.referenced_ids()
+    unused = [pid for pid in pinned if pid not in referenced]
+    if unused:
+        print(f"  warning: {len(unused)} pinned id(s) are not referenced by any "
+              f"node (typo?): {unused[:5]}{' ...' if len(unused) > 5 else ''}")
+    return len(pinned)
 
 
 def _stats(g: nodes.Graph) -> str:
@@ -406,6 +435,8 @@ def main(argv: list[str]) -> int:
     p.add_argument("--vectors", type=int, default=4096,
                    help="random vectors for the equivalence gate (default 4096)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--force-fraig", action="store_true",
+                   help="run FRAIG even with --pin (may hit a slow SAT miter)")
     args = p.parse_args(argv[1:])
 
     g = nodes.parse(args.input)
@@ -414,7 +445,13 @@ def main(argv: list[str]) -> int:
         print(f"pinned {n_pins} free inputs to constants")
     print(f"input:  {_stats(g)}")
 
-    g_out = optimize(g)
+    # Partial evaluation skips FRAIG by default: pinning can create a hard SAT
+    # miter that Cadical (unbounded) would grind on. strash still captures most
+    # of the pinned gain; --force-fraig opts back in.
+    rounds = 0 if (args.pin and not args.force_fraig) else 8
+    if args.pin and rounds == 0:
+        print("  (partial eval: FRAIG skipped; use --force-fraig to enable)")
+    g_out = optimize(g, fraig_rounds=rounds)
     print(f"output: {_stats(g_out)}")
     n_in = sum(1 for n in g.nodes.values() if n.type == "N")
     n_out = sum(1 for n in g_out.nodes.values() if n.type == "N")

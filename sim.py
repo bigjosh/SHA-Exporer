@@ -52,16 +52,20 @@ def equivalence(g_a: nodes.Graph, g_b: nodes.Graph, n_vectors: int = 4096,
                 seed: int = 0) -> tuple[bool, str]:
     """Random-vector equivalence over shared free inputs / outputs."""
     fa, fb = g_a.free_inputs(), g_b.free_inputs()
-    if fa != fb:
-        return False, f"different free inputs (|A|={len(fa)}, |B|={len(fb)})"
     oa = sorted(n.id for n in g_a.outputs())
     ob = sorted(n.id for n in g_b.outputs())
     if oa != ob:
         return False, "different outputs"
 
+    # Compare over the UNION of free inputs: drive shared inputs identically and
+    # let each graph ignore names it doesn't reference. This still catches real
+    # inequivalence (if one graph actually depends on an input the other dropped,
+    # varying it changes only one graph's outputs -> mismatch), but tolerates the
+    # legitimate case where optimization/partial-eval renders an input irrelevant.
+    note = "" if fa == fb else f" (free-input sets differ: |A|={len(fa)}, |B|={len(fb)})"
     n_words = (n_vectors + 63) // 64
     rng = np.random.default_rng(seed)
-    iw = random_input_arrays(sorted(fa), n_words, rng)
+    iw = random_input_arrays(sorted(fa | fb), n_words, rng)
     out_a = simulate_outputs(g_a, iw, n_words)
     out_b = simulate_outputs(g_b, iw, n_words)
     for oid in oa:
@@ -71,7 +75,7 @@ def equivalence(g_a: nodes.Graph, g_b: nodes.Graph, n_vectors: int = 4096,
             w = int(nz[0])
             bit = int(diff[w] & (~diff[w] + np.uint64(1))).bit_length() - 1
             return False, f"mismatch at output {oid}, vector {w * 64 + bit}"
-    return True, f"equivalent over {n_words * 64} random vectors"
+    return True, f"equivalent over {n_words * 64} random vectors{note}"
 
 
 def main(argv: list[str]) -> int:
