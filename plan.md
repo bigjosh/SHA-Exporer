@@ -230,7 +230,7 @@ equivalence + the `hashlib` battery, and FRAIG merges are individually SAT-prove
 |------|-----:|--------:|-------|
 | baseline (strash) | 253,620 | −35.4% | structural hashing = constant fold + CSE + dead-cone; all 2,305 constants fold away |
 | + FRAIG (Phase 2) | 239,780 | −38.9% | 11,856 SAT-proven functional merges (incl. ~3,950 functionally-constant nodes) |
-| + maj cut-rewrite (Phase 3) | ~227k | ~−42% | 1,952 round-`Maj` nodes rewritten XOR-of-3-ANDs → optimal OR/MUX (−~11.7k AND); adder carries (already optimal) skipped |
+| + maj cut-rewrite (Phase 3) | **230,020** | **−41.4%** | 1,952 round-`Maj` nodes → optimal OR/MUX (−5,856 AND post-FRAIG; FRAIG already captured ~half the maj savings); adder carries skipped |
 
 **Soundness of FRAIG.** Simulation alone is *unsound* — two nodes can agree on
 thousands of random vectors yet differ on rare inputs (an early sim-only merge

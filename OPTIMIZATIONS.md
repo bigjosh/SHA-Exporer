@@ -8,7 +8,7 @@ node-file format see [`plan.md`](plan.md).
 ## TL;DR
 
 - Base circuit: **392,448 NAND** (`SHA256-base.nodes`, single 512-bit block, fixed IV).
-- After the full pipeline: **~227,000 NAND (≈ −42%)**, provably equivalent.
+- After the full pipeline: **230,020 NAND (−41.4%)**, provably equivalent.
 - We are **near the NAND-realization floor** (estimated hard floor ~190–200k). A 2×
   reduction is not achievable: the circuit is XOR/adder-dominated, and in a NAND
   basis a 2-input XOR costs 4 NAND and a full adder 9 NAND — both irreducible.
@@ -42,7 +42,10 @@ is in the majority NPN class into the optimal `(a&b)|(a&c)|(b&c)` OR/MUX form. T
 generator emits `Maj` as `XOR-of-3-ANDs` (FIPS-faithful) which strash/FRAIG can't
 restructure across the XOR boundary; this pass does. Sound (exact TT + a global
 gain-guard that never regresses).
-> Rewrites **1,952 round-`Maj` nodes** (−~11.7k AND). Full pipeline → **~227k NAND**.
+> Rewrites **1,952 round-`Maj` nodes**. On the post-FRAIG graph it removes 5,856 AND
+> (228,973 → 223,117) — fewer than the 11,712 it removes on a strash-only graph,
+> because FRAIG had already merged ~half the maj-cone savings. Full pipeline →
+> **230,020 NAND (−41.4%)**.
 
 ### Partial evaluation (`--pin`)
 Pin some input bits to constants (e.g. a known-length message's padding) and
@@ -59,7 +62,7 @@ to enable it.
 | base | 392,448 | — |
 | strash | 253,620 | −35.4% |
 | + FRAIG | 239,780 | −38.9% |
-| + maj-rewrite | ~227,000 | ~−42% |
+| + maj-rewrite | 230,020 | −41.4% |
 
 Verified throughout against Python `hashlib` (`""`, `"abc"`, the standard pangram,
 55-byte blocks) plus 8,192-vector random equivalence between input and output.
