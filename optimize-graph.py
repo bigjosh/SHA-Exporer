@@ -51,6 +51,32 @@ CONST1 = 1
 # strash already captures most of the pinned gain.
 SAT_PHASE_TIME_S = 1800
 
+# maj cut-rewrite: enumerate <=3-input cuts and rewrite nodes whose exact function
+# is majority into the optimal OR/MUX form (FIPS keeps Maj as XOR-of-ANDs, which
+# strash cannot restructure). Sound: only exact-TT majority nodes are rewritten.
+CUT_CAP = 64         # max (non-dominated) cuts kept per node during enumeration
+
+
+def _maj_class() -> dict[int, tuple]:
+    """Map every truth table in the 3-input majority NPN class to its phasing:
+    tt -> (in0_neg, in1_neg, in2_neg, out_neg). Covers all input/output negations,
+    since the round Maj's inputs are often complemented literals."""
+    proj = (0xAA, 0xCC, 0xF0)
+    cls: dict[int, list[tuple]] = {}
+    for s0 in (0, 1):
+        for s1 in (0, 1):
+            for s2 in (0, 1):
+                a = proj[0] ^ (0xFF if s0 else 0)
+                b = proj[1] ^ (0xFF if s1 else 0)
+                c = proj[2] ^ (0xFF if s2 else 0)
+                t = ((a & b) | (a & c) | (b & c)) & 0xFF
+                cls.setdefault(t, []).append((s0, s1, s2, 0))
+                cls.setdefault(t ^ 0xFF, []).append((s0, s1, s2, 1))
+    return cls  # each tt maps to BOTH self-dual phasings; pick the realizable one
+
+
+MAJ_CLASS = _maj_class()
+
 
 class Aig:
     """And-Inverter Graph with on-the-fly structural hashing."""
@@ -312,6 +338,131 @@ def fraig(aig: Aig, outputs: list[tuple[str, int]], n_words: int = 16,
     return new, new_outputs, len(merge)
 
 
+def _build_maj(aig: Aig, x: int, y: int, z: int) -> int:
+    """Build majority(x, y, z) = (x&y)|(x&z)|(y&z) over literals, via strash."""
+    xy = aig.AND(x, y)
+    xz = aig.AND(x, z)
+    yz = aig.AND(y, z)
+    or1 = aig.AND(xy ^ 1, xz ^ 1) ^ 1          # OR(xy, xz)
+    return aig.AND(or1 ^ 1, yz ^ 1) ^ 1        # OR(or1, yz)
+
+
+def _lit_and_exists(aig: Aig, la: int, lb: int) -> bool:
+    """True if AND(la, lb) needs no new node: either it's a trivial fold, or the
+    strash node already exists."""
+    if la == lb or la == (lb ^ 1) or la < 2 or lb < 2:
+        return True  # AND(x,x)=x, AND(x,~x)=0, or a constant -> no new node
+    a, b = (la, lb) if la < lb else (lb, la)
+    return (a, b) in aig.strash
+
+
+def _expand_tt(tt: int, positions: list[int], k: int) -> int:
+    """Expand a truth table over len(positions) vars to k vars; source variable i
+    maps to bit positions[i] of the k-variable minterm index."""
+    out = 0
+    nsrc = len(positions)
+    for m in range(1 << k):
+        sm = 0
+        for si in range(nsrc):
+            if (m >> positions[si]) & 1:
+                sm |= 1 << si
+        if (tt >> sm) & 1:
+            out |= 1 << m
+    return out
+
+
+def _find_maj_nodes(aig: Aig, reach: set[int]) -> dict[int, tuple]:
+    """Enumerate <=3-input cuts with exact truth tables; return {idx: (leaves, phase)}
+    for AND nodes whose function over a 3-leaf cut is majority (phase 0) or its
+    complement (phase 1). Sound: detection is by exact truth table."""
+    cuts: dict[int, list[tuple[tuple, int]]] = {0: [((0,), 0)]}
+    marks: dict[int, tuple] = {}
+    f0a, f1a, ispi = aig.fanin0, aig.fanin1, aig.is_pi
+    for idx in range(1, len(f0a)):
+        if ispi[idx]:
+            cuts[idx] = [((idx,), 2)]
+            continue
+        if idx not in reach:
+            continue
+        a, b = f0a[idx], f1a[idx]
+        n0, c0 = a >> 1, a & 1
+        n1, c1 = b >> 1, b & 1
+        seen = {(idx,): 2}  # trivial (identity) cut
+        for (l0, t0) in cuts[n0]:
+            for (l1, t1) in cuts[n1]:
+                u = tuple(sorted(set(l0) | set(l1)))
+                if len(u) > 3 or u in seen:
+                    continue
+                k = len(u)
+                mask = (1 << (1 << k)) - 1
+                e0 = _expand_tt(t0, [u.index(x) for x in l0], k)
+                e1 = _expand_tt(t1, [u.index(x) for x in l1], k)
+                if c0:
+                    e0 ^= mask
+                if c1:
+                    e1 ^= mask
+                seen[u] = e0 & e1
+        matched = False
+        for u, tt in seen.items():  # detect over ALL candidate cuts
+            if len(u) != 3 or 0 in u or tt not in MAJ_CLASS:
+                continue
+            g0, g1, g2 = u
+            for (s0, s1, s2, so) in MAJ_CLASS[tt]:  # try both self-dual phasings
+                l0, l1, l2 = (g0 << 1) ^ s0, (g1 << 1) ^ s1, (g2 << 1) ^ s2
+                # Only rewrite when all three pairwise products already exist (the
+                # generator's XOR-of-ANDs Maj). Adder carries are maj too but are
+                # built as OR(a&b, c&(a^b)) -> a&c, b&c absent -> OR-form would ADD
+                # nodes, so skip them.
+                if (_lit_and_exists(aig, l0, l1) and _lit_and_exists(aig, l0, l2)
+                        and _lit_and_exists(aig, l1, l2)):
+                    marks[idx] = (l0, l1, l2, so)
+                    matched = True
+                    break
+            if matched:
+                break
+        # keep only non-dominated cuts (drop any cut that has a proper subset cut);
+        # the majority's true 3-leaf cut is never dominated, so it survives.
+        sets = {u: frozenset(u) for u in seen}
+        keep = [(u, tt) for u, tt in seen.items()
+                if not any(sets[v] < sets[u] for v in seen if v != u)]
+        cuts[idx] = keep[:CUT_CAP]
+    return marks
+
+
+def maj_rewrite(aig: Aig, outputs: list[tuple[str, int]], verbose: bool = False
+                ) -> tuple[Aig, list[tuple[str, int]], int]:
+    """Rewrite majority-class nodes into the optimal OR/MUX form. Sound (exact-TT
+    detection + functionally-identical replacement); accepted only if it reduces
+    the reachable AND count."""
+    reach = reachable_ands(aig, outputs)
+    marks = _find_maj_nodes(aig, reach)
+    if not marks:
+        return aig, outputs, 0
+    new = Aig()
+    n = len(aig.fanin0)
+    new_lit = [0] * n
+    for i in range(1, n):
+        if aig.is_pi[i]:
+            new_lit[i] = new.pi(aig.pi_name[i])
+        elif i in marks:
+            l0, l1, l2, so = marks[i]
+            x = new_lit[l0 >> 1] ^ (l0 & 1)
+            y = new_lit[l1 >> 1] ^ (l1 & 1)
+            z = new_lit[l2 >> 1] ^ (l2 & 1)
+            new_lit[i] = _build_maj(new, x, y, z) ^ so
+        elif i in reach:
+            a, b = aig.fanin0[i], aig.fanin1[i]
+            new_lit[i] = new.AND(new_lit[a >> 1] ^ (a & 1), new_lit[b >> 1] ^ (b & 1))
+    new_outputs = [(oid, new_lit[l >> 1] ^ (l & 1)) for oid, l in outputs]
+    old_n, new_n = len(reach), len(reachable_ands(new, new_outputs))
+    if new_n >= old_n:  # never regress
+        return aig, outputs, 0
+    if verbose:
+        print(f"  maj-rewrite: {len(marks)} majority nodes; "
+              f"{old_n} -> {new_n} AND nodes", flush=True)
+    return new, new_outputs, len(marks)
+
+
 def lower(aig: Aig, outputs: list[tuple[str, int]]) -> nodes.Graph:
     """Lower the AIG back to a NAND/C/O graph, emitting only nodes reachable
     from the outputs."""
@@ -391,6 +542,8 @@ def optimize(g: nodes.Graph, fraig_rounds: int = 8, verbose: bool = True) -> nod
             break
     if verbose:
         print(f"  fraig total merged: {total_merged}", flush=True)
+    # majority cut-rewrite (sound, SAT-free; safe with or without pins)
+    aig, outputs, n_maj = maj_rewrite(aig, outputs, verbose=verbose)
     return lower(aig, outputs)
 
 
