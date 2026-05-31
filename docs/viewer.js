@@ -49,6 +49,7 @@ let posXY;                 // interleaved [x0,y0,x1,y1,...] for the GPU
 let state, hilite, seen2;  // Uint8Array(N)
 let inputVal;              // Uint8Array(#input bits) 0/1
 let outStart, outList;     // fanout CSR for light-cone descend
+let order, posInOrder, layerOf;  // nodes sorted by (layer, x) -> arrow-key navigation
 let bounds;
 // spatial pick grid
 const CELL = 3.0;
@@ -56,8 +57,8 @@ let grid, gridCols;
 
 // ---- GL objects -----------------------------------------------------------
 let progNode, progWire;
-let vaoNode, vaoWire;
-let stateTex, hiliteTex, glyphTex, texW, texH;
+let vaoNode, vaoWire, quadBuf, nodePosBuf, nodeTypeBuf, wirePosBuf, wireDrvBuf, wireTgtBuf;
+let stateTex, hiliteTex, glyphTex, texW, texH, texScratch;
 let wireVertexCount = 0;
 let uNode = {}, uWire = {};
 
@@ -217,9 +218,11 @@ function loadData(buf) {
   for (let i = 0; i < N; i++) { posXY[2*i] = posX[i]; posXY[2*i+1] = posY[i]; }
   state = new Uint8Array(N); hilite = new Uint8Array(N); seen2 = new Uint8Array(N);
   inputVal = new Uint8Array(inByBit.length);
+  lockedNode = -1; pickedNode = -1; hoverActive = false; pointers.clear();   // reset interaction on (re)load
 
   buildFanout();
   buildGrid();
+  buildLayerIndex();
   initGL();
   buildWires();
 
@@ -273,28 +276,34 @@ function pickAt(wx, wy, radius) {
 // GL init: programs, geometry, textures
 // ===========================================================================
 function initGL() {
-  if (progNode) return;            // once
-  progNode = link(NODE_VS, NODE_FS);
-  progWire = link(WIRE_VS, WIRE_FS);
-  uNode = uniforms(progNode, ["uCam","uZoom","uViewport","uNodeHalf","uStateTex","uHiliteTex","uTexW","uGlyph","uHoverActive"]);
-  uWire = uniforms(progWire, ["uCam","uZoom","uViewport","uStateTex","uHiliteTex","uTexW","uHoverActive","uWireAlpha"]);
+  if (!progNode) {                 // one-time: programs, glyph atlas, the static unit quad
+    progNode = link(NODE_VS, NODE_FS);
+    progWire = link(WIRE_VS, WIRE_FS);
+    uNode = uniforms(progNode, ["uCam","uZoom","uViewport","uNodeHalf","uStateTex","uHiliteTex","uTexW","uGlyph","uHoverActive"]);
+    uWire = uniforms(progWire, ["uCam","uZoom","uViewport","uStateTex","uHiliteTex","uTexW","uHoverActive","uWireAlpha"]);
+    quadBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]), gl.STATIC_DRAW);
+    glyphTex = makeGlyphAtlas();
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  }
 
-  // node quad (two triangles) + per-instance pos/type
+  // per-load: node VAO + instance buffers + state/hilite textures sized to THIS graph
+  // (recreated each load so dropping a different .glayout doesn't reuse stale GPU state)
+  if (vaoNode) { gl.deleteVertexArray(vaoNode); gl.deleteBuffer(nodePosBuf); gl.deleteBuffer(nodeTypeBuf); }
   vaoNode = gl.createVertexArray(); gl.bindVertexArray(vaoNode);
-  const quad = new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]);
-  const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, posXY, gl.STATIC_DRAW);
+  nodePosBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nodePosBuf); gl.bufferData(gl.ARRAY_BUFFER, posXY, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
-  const tb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, tb); gl.bufferData(gl.ARRAY_BUFFER, type, gl.STATIC_DRAW);
+  nodeTypeBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nodeTypeBuf); gl.bufferData(gl.ARRAY_BUFFER, type, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_BYTE, 0, 0); gl.vertexAttribDivisor(2, 1);
   gl.bindVertexArray(null);
 
-  // state + highlight textures (R8UI, indexed by node id)
   texW = Math.ceil(Math.sqrt(N)); texH = Math.ceil(N / texW);
-  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  texScratch = new Uint8Array(texW * texH);    // reused upload buffer (padding past N stays 0)
+  if (stateTex) gl.deleteTexture(stateTex);
+  if (hiliteTex) gl.deleteTexture(hiliteTex);
   stateTex = makeU8Tex(); hiliteTex = makeU8Tex();
-  glyphTex = makeGlyphAtlas();
 }
 
 function makeU8Tex() {
@@ -306,10 +315,10 @@ function makeU8Tex() {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return t;
 }
-function uploadU8(tex, data) {            // data: Uint8Array(N)
-  const buf = new Uint8Array(texW * texH); buf.set(data);
+function uploadU8(tex, data) {            // data: Uint8Array(N); texScratch is texW*texH
+  texScratch.set(data);
   gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, texW, texH, gl.RED_INTEGER, gl.UNSIGNED_BYTE, buf);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, texW, texH, gl.RED_INTEGER, gl.UNSIGNED_BYTE, texScratch);
 }
 
 function makeGlyphAtlas() {
@@ -349,12 +358,13 @@ function buildWires() {
   }
   wireVertexCount = v;
 
+  if (vaoWire) { gl.deleteVertexArray(vaoWire); gl.deleteBuffer(wirePosBuf); gl.deleteBuffer(wireDrvBuf); gl.deleteBuffer(wireTgtBuf); }
   vaoWire = gl.createVertexArray(); gl.bindVertexArray(vaoWire);
-  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  wirePosBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, wirePosBuf); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-  const db = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, db); gl.bufferData(gl.ARRAY_BUFFER, drv, gl.STATIC_DRAW);
+  wireDrvBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, wireDrvBuf); gl.bufferData(gl.ARRAY_BUFFER, drv, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(1); gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_INT, 0, 0);
-  const gb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, gb); gl.bufferData(gl.ARRAY_BUFFER, tgt, gl.STATIC_DRAW);
+  wireTgtBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, wireTgtBuf); gl.bufferData(gl.ARRAY_BUFFER, tgt, gl.STATIC_DRAW);
   gl.enableVertexAttribArray(2); gl.vertexAttribIPointer(2, 1, gl.UNSIGNED_INT, 0, 0);
   gl.bindVertexArray(null);
 }
@@ -408,24 +418,30 @@ function updateHash(bytes) {
 function markCone(start) {
   hilite.fill(0);
   let up = 0, down = 0;
+  // up: ancestors via fanins. Mark-on-push (using hilite as the visited set) keeps the
+  // stack at the frontier instead of growing it to the full edge count.
+  hilite[start] = 1;
   let stack = [start];
-  while (stack.length) {                                 // up: fanins
+  while (stack.length) {
     const u = stack.pop();
-    if (hilite[u]) continue;
-    hilite[u] = 1; up++;
     const a = fanin0[u], b = fanin1[u];
-    if (a >= 0) stack.push(a); if (b >= 0) stack.push(b);
+    if (a >= 0 && !hilite[a]) { hilite[a] = 1; up++; stack.push(a); }
+    if (b >= 0 && !hilite[b]) { hilite[b] = 1; up++; stack.push(b); }
   }
-  seen2.fill(0); stack = [start];
-  while (stack.length) {                                 // down: fanouts
+  // down: descendants via fanouts. Separate visited set (seen2) since hilite is already
+  // set for the ancestors; mark-on-push again (a low-depth node fans out to ~most of the graph).
+  seen2.fill(0); seen2[start] = 1;
+  stack = [start];
+  while (stack.length) {
     const u = stack.pop();
-    if (seen2[u]) continue;
-    seen2[u] = 1; hilite[u] = 1; down++;
-    for (let e = outStart[u]; e < outStart[u + 1]; e++) stack.push(outList[e]);
+    for (let e = outStart[u]; e < outStart[u + 1]; e++) {
+      const c = outList[e];
+      if (!seen2[c]) { seen2[c] = 1; hilite[c] = 1; down++; stack.push(c); }
+    }
   }
   hilite[start] = 2;
   uploadU8(hiliteTex, hilite);
-  return { up: up - 1, down: down - 1 };                 // exclude the node itself
+  return { up, down };                                   // ancestors / descendants (excluding the node)
 }
 
 function nodeLabel(i) {
@@ -473,7 +489,7 @@ function render() {
     gl.uniform2f(uWire.uCam, cam.x, cam.y); gl.uniform1f(uWire.uZoom, cam.zoom);
     gl.uniform2f(uWire.uViewport, VP[0], VP[1]); gl.uniform1i(uWire.uTexW, texW);
     gl.uniform1i(uWire.uHoverActive, hoverActive ? 1 : 0);
-    gl.uniform1f(uWire.uWireAlpha, Math.max(wireAlpha, hoverActive ? 0.0 : 0.0));
+    gl.uniform1f(uWire.uWireAlpha, wireAlpha);
     bindTex(uWire, 0, 1);
     gl.drawArrays(gl.LINES, 0, wireVertexCount);
   }
@@ -542,7 +558,7 @@ canvas.addEventListener("pointerdown", e => {
 
 canvas.addEventListener("pointermove", e => {
   if (!pointers.has(e.pointerId)) {                      // un-pressed mouse move -> hover light-cone
-    if (e.pointerType === "mouse" && meta && lockedNode < 0) {
+    if (e.pointerType !== "touch" && meta && lockedNode < 0) {   // mouse or pen hover
       pendingHover = devXY(e);
       if (!hoverRAF) hoverRAF = requestAnimationFrame(() => {
         hoverRAF = 0; const w = screenToWorld(pendingHover.x, pendingHover.y);
@@ -584,20 +600,79 @@ function endPointer(e) {
 }
 canvas.addEventListener("pointerup", endPointer);
 canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("pointerleave", () => { if (lockedNode < 0 && pointers.size === 0) setHover(-1); });
 
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
   const s = devXY(e);
   const before = screenToWorld(s.x, s.y);
-  cam.zoom = clamp(cam.zoom * Math.exp(-e.deltaY * 0.0015), minZoom, maxZoom);
+  // normalize wheel delta: 0=pixels, 1=lines (Firefox), 2=pages
+  const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * canvas.height : e.deltaY;
+  cam.zoom = clamp(cam.zoom * Math.exp(-dy * 0.0015), minZoom, maxZoom);
   const after = screenToWorld(s.x, s.y);
   cam.x += before.x - after.x; cam.y += before.y - after.y;
   requestDraw();
 }, { passive: false });
 
+// ---- keyboard navigation of the highlighted node --------------------------
+// Per-layer index: node ids sorted by x within each depth layer, so left/right
+// can step along a layer; up/down use the fanin/fanout arrays directly.
+function buildLayerIndex() {
+  layerOf = new Int32Array(N);
+  for (let i = 0; i < N; i++) layerOf[i] = Math.round(posY[i] / meta.dy);
+  order = Array.from({ length: N }, (_, i) => i);
+  order.sort((a, b) => layerOf[a] - layerOf[b] || posX[a] - posX[b] || a - b);
+  posInOrder = new Int32Array(N);
+  for (let k = 0; k < N; k++) posInOrder[order[k]] = k;
+}
+
+// up = leftmost fan-in (feeds current); down = leftmost fan-out (fed by current);
+// left/right = neighbour in the same layer, ordered by x.
+function navFrom(node, dir) {
+  if (node < 0) return -1;
+  if (dir === "up") {
+    let best = -1, bx = Infinity;
+    const a = fanin0[node], b = fanin1[node];
+    if (a >= 0 && posX[a] < bx) { best = a; bx = posX[a]; }
+    if (b >= 0 && posX[b] < bx) { best = b; bx = posX[b]; }
+    return best;
+  }
+  if (dir === "down") {
+    let best = -1, bx = Infinity;
+    for (let e = outStart[node]; e < outStart[node + 1]; e++) {
+      const c = outList[e]; if (posX[c] < bx) { best = c; bx = posX[c]; }
+    }
+    return best;
+  }
+  const k = posInOrder[node];
+  if (dir === "left")  return (k > 0     && layerOf[order[k - 1]] === layerOf[node]) ? order[k - 1] : -1;
+  if (dir === "right") return (k < N - 1 && layerOf[order[k + 1]] === layerOf[node]) ? order[k + 1] : -1;
+  return -1;
+}
+
+// pan only enough to keep node `i` within the central ~64% (≥18% from each edge)
+function ensureVisible(i) {
+  const hx = canvas.width * 0.32 / cam.zoom, hy = canvas.height * 0.32 / cam.zoom;
+  if (posX[i] > cam.x + hx) cam.x = posX[i] - hx; else if (posX[i] < cam.x - hx) cam.x = posX[i] + hx;
+  if (posY[i] > cam.y + hy) cam.y = posY[i] - hy; else if (posY[i] < cam.y - hy) cam.y = posY[i] + hy;
+}
+
+function navKey(dir) {
+  const cur = lockedNode >= 0 ? lockedNode : pickedNode;   // walk the locked node if locked, else the hovered one
+  if (cur < 0) return;
+  const t = navFrom(cur, dir);
+  if (t < 0) { toast(dir === "up" ? "no fan-in here" : dir === "down" ? "no fan-out here" : "edge of layer"); return; }
+  if (lockedNode >= 0) lockedNode = t;
+  setHover(t);
+  ensureVisible(t);
+  requestDraw();
+}
+
+const ARROWS = { ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right" };
 window.addEventListener("keydown", e => {
   if (e.target === elMsg) return;
-  if (e.key === "f") fitWidth();
+  if (ARROWS[e.key]) { e.preventDefault(); navKey(ARROWS[e.key]); }
+  else if (e.key === "f") fitWidth();
   else if (e.key === "w") { wiresOn = !wiresOn; toast("wires " + (wiresOn ? "on" : "off")); requestDraw(); }
   else if (e.key === "Escape") { lockedNode = -1; setHover(-1); }
 });
@@ -638,6 +713,11 @@ window.DBG = {
   hoverNode(i) { lockedNode = i; setHover(i); },
   clearHover() { lockedNode = -1; setHover(-1); },
   pick: (wx, wy, r) => pickAt(wx, wy, r === undefined ? 16 / cam.zoom : r),
+  picked() { return pickedNode; },
+  locked() { return lockedNode; },
+  fanins(i) { return [fanin0[i], fanin1[i]].filter(x => x >= 0); },
+  fanouts(i) { const a = []; for (let e = outStart[i]; e < outStart[i + 1]; e++) a.push(outList[e]); return a; },
+  navFrom,
 };
 
 function boot() {

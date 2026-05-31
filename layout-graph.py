@@ -107,7 +107,6 @@ def build_arrays(g: nodes.Graph, t0: float):
 
 def compute_layers(typ, fi0, fi1, F, N, t0):
     """Longest-path layer (depth) for every node; outputs forced to a bottom row."""
-    layer = np.zeros(N, np.int32)
     f0 = fi0.tolist()                       # python ints: faster scalar access in loop
     f1 = fi1.tolist()
     lay = [0] * N
@@ -187,7 +186,7 @@ def abc_self_check(typ, fi0, fi1, bit, F, N, in_by_bit, out_by_bit, t0):
     for byte_i in range(64):
         for k in range(8):                              # k=0 -> MSB (matches verify-graph.py)
             b_idx = byte_i * 8 + k
-            ni = in_by_bit[b_idx]
+            ni = in_by_bit[b_idx] if b_idx < len(in_by_bit) else -1
             if ni >= 0:
                 state[ni] = (block[byte_i] >> (7 - k)) & 1
 
@@ -208,8 +207,8 @@ def abc_self_check(typ, fi0, fi1, bit, F, N, in_by_bit, out_by_bit, t0):
 
     value = 0
     for hb in range(256):
-        ni = out_by_bit[hb]
-        value = (value << 1) | (st[ni] & 1)
+        ni = out_by_bit[hb] if hb < len(out_by_bit) else -1
+        value = (value << 1) | ((st[ni] & 1) if ni >= 0 else 0)
     got = f"{value:064x}"
     exp = hashlib.sha256(msg).hexdigest()
     ok = got == exp
@@ -287,6 +286,13 @@ def main(argv):
     out_by_bit = np.full(n_out_bits, -1, np.int32)
     in_by_bit[bit[in_mask]] = np.nonzero(in_mask)[0].astype(np.int32)
     out_by_bit[bit[out_mask]] = np.nonzero(out_mask)[0].astype(np.int32)
+
+    # inputs/outputs must be a bijection onto dense bit indices 0..n-1 (no gaps, no
+    # duplicates); otherwise the viewer would index a -1 slot and read a wrong digest.
+    if ((in_by_bit < 0).any() or int(in_mask.sum()) != n_in_bits or
+            (out_by_bit < 0).any() or int(out_mask.sum()) != n_out_bits):
+        _log("ABORT: MESSAGE-/HASH- bit indices are not dense & unique; not writing.", t0)
+        return 1
 
     ok = abc_self_check(typ, fi0, fi1, bit, F, N, in_by_bit, out_by_bit, t0)
     if not ok:
