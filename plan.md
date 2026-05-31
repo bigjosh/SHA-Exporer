@@ -230,6 +230,7 @@ equivalence + the `hashlib` battery, and FRAIG merges are individually SAT-prove
 |------|-----:|--------:|-------|
 | baseline (strash) | 253,620 | −35.4% | structural hashing = constant fold + CSE + dead-cone; all 2,305 constants fold away |
 | + FRAIG (Phase 2) | 239,780 | −38.9% | 11,856 SAT-proven functional merges (incl. ~3,950 functionally-constant nodes) |
+| + maj cut-rewrite (Phase 3) | ~227k | ~−42% | 1,952 round-`Maj` nodes rewritten XOR-of-3-ANDs → optimal OR/MUX (−~11.7k AND); adder carries (already optimal) skipped |
 
 **Soundness of FRAIG.** Simulation alone is *unsound* — two nodes can agree on
 thousands of random vectors yet differ on rare inputs (an early sim-only merge
@@ -248,21 +249,28 @@ computing correct SHA-256 over the 24 free bits).
 bit-parallel equivalence). The optimizer is deterministic (same input ⇒ byte-
 identical output).
 
-**Why ~239k and not lower:** the cost is dominated by ~19,200 modular adders,
-which are already near-optimal in the AND-only AIG after strash+FRAIG. Pushing
-substantially lower needs the higher-complexity passes below.
+**Near the NAND floor.** A multi-lens analysis confirmed the circuit is at/near
+its NAND-realization floor: the ~19,200 modular adders reach the textbook optimum
+(9 NAND/full-adder), `Ch` reaches the optimal MUX (4 NAND), and `Σ`/`σ` are
+GF(2)-linear *circulants with distinct rotation offsets* → provably sharing-free
+(already ~optimal). The one structural slack was `Maj` (XOR-of-3-ANDs), now
+captured by the Phase-3 cut-rewrite. The estimated hard floor is ~190–200k NAND;
+a 2× reduction is not achievable.
 
-**Roadmap (future work, ordered by ROI/risk):**
-- **XAIG** — first-class XOR/MAJ nodes + optimal XOR3/MAJ3/MUX NAND lowering
-  (recognizes that `Ch` is a MUX, adder sum is XOR3, carry is MAJ3); reduces both
-  representation size and the lowered NAND count for the adder/`Ch`/`Maj` logic.
-- **GF(2)-linear (P-LIN)** — collapse the pure-XOR Σ/σ/schedule cones to parity
-  sets and re-synthesize a shared minimal XOR network (Boyar–Peralta-style).
-- **CSA** — carry-save re-synthesis of the multi-operand adds (depth, and exposes
-  shared compressor cells).
-- **NPN-4 cut rewriting** — curated optimal subgraphs for recurring 4-input cuts
-  (sound via exact local truth tables); a polisher for residual local slack.
-- **Outer driver** — fixpoint loop + wall-clock budget + checkpoint/resume +
-  randomized local search (lets a run be continued for a bigger result later).
-- **Depth balancing** — size-preserving; balance *associative* XOR/AND trees only
-  (carry ripples are not associative). Improves graph explorability for the UI.
+**Remaining levers (diminishing / out of scope):**
+- **Inverter-minimizing lowering** — measured to be ~0: the current lowering is
+  already inverter-minimal for a fixed AIG (you can't make `a∧b` in < 2 NANDs).
+- **SAT don't-care optimization (ODC/SDC)** — ~0 here: message bits are free
+  inputs and all 256 outputs are observed, so don't-care sets are nearly empty.
+- **CSA / Wallace adder trees** — depth only, ~0 node-count (full-adder count is
+  conserved); useful for graph explorability, not size.
+- **XOR-native representation (XAIG/XMG)** — the only >10% long-shot, but its gain
+  tends to *evaporate at NAND lowering* (XOR costs 4 NAND regardless). Research
+  spike, not a sure win.
+- **Outer driver** — fixpoint loop + wall-clock budget + checkpoint/resume; adds
+  no reduction itself, but makes a run resumable/extensible.
+
+**Note on runtime:** the FRAIG SAT phase is fast on an idle machine (~minutes) but
+a few hard miters can stretch to minutes each under heavy CPU contention; the
+1800s phase cap bounds it (soundly dropping unconfirmed merges) so it always
+terminates. maj-rewrite and strash are fast (~tens of seconds).
