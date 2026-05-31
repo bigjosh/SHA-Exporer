@@ -515,42 +515,82 @@ function fitWidth() {
   requestDraw();
 }
 
-let dragging = false, lastX = 0, lastY = 0, moved = false, hoverRAF = 0, pendingMouse = null;
-canvas.addEventListener("mousedown", e => { dragging = true; moved = false; lastX = e.clientX; lastY = e.clientY; });
-window.addEventListener("mouseup", e => {
-  dragging = false;
-  if (!moved && meta) {                                  // click = lock/unlock cone
-    const r = canvas.getBoundingClientRect();
-    const w = screenToWorld((e.clientX - r.left) * DPR, (e.clientY - r.top) * DPR);
-    const n = pickAt(w.x, w.y, Math.min(CELL, 16 / cam.zoom));
-    if (n >= 0) { lockedNode = (lockedNode === n) ? -1 : n; setHover(lockedNode >= 0 ? lockedNode : -1); }
-    else { lockedNode = -1; setHover(-1); }
+// Unified pointer interaction (mouse + touch + pen): one-pointer pan, two-pointer
+// pinch-zoom+pan anchored to the finger midpoint, tap/click to lock the cone, and
+// mouse-only hover. touch-action:none on the canvas keeps the browser from hijacking.
+const pointers = new Map();              // active pointerId -> {x,y} in device px
+let panId = -1, panLast = null, downStart = null, movedFar = false, pinchPrev = null;
+let hoverRAF = 0, pendingHover = null;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function devXY(e) { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * DPR, y: (e.clientY - r.top) * DPR }; }
+function pinchState(p) { const dx = p[0].x - p[1].x, dy = p[0].y - p[1].y; return { dist: Math.hypot(dx, dy) || 1, mx: (p[0].x + p[1].x) / 2, my: (p[0].y + p[1].y) / 2 }; }
+function tapPick(pos) {
+  if (!meta || !pos) return;
+  const w = screenToWorld(pos.x, pos.y);
+  const n = pickAt(w.x, w.y, Math.min(CELL, 18 / cam.zoom));
+  if (n >= 0) { lockedNode = (lockedNode === n) ? -1 : n; setHover(lockedNode >= 0 ? lockedNode : -1); }
+  else { lockedNode = -1; setHover(-1); }
+}
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  const p = devXY(e); pointers.set(e.pointerId, p);
+  if (pointers.size === 1) { panId = e.pointerId; panLast = p; downStart = p; movedFar = false; pinchPrev = null; }
+  else if (pointers.size === 2) { panId = -1; movedFar = true; pinchPrev = pinchState([...pointers.values()]); }
+}, { passive: false });
+
+canvas.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) {                      // un-pressed mouse move -> hover light-cone
+    if (e.pointerType === "mouse" && meta && lockedNode < 0) {
+      pendingHover = devXY(e);
+      if (!hoverRAF) hoverRAF = requestAnimationFrame(() => {
+        hoverRAF = 0; const w = screenToWorld(pendingHover.x, pendingHover.y);
+        setHover(pickAt(w.x, w.y, Math.min(CELL, 18 / cam.zoom)));
+      });
+    }
+    return;
   }
-});
-window.addEventListener("mousemove", e => {
-  if (dragging) {
-    moved = true;
-    cam.x -= (e.clientX - lastX) * DPR / cam.zoom;
-    cam.y -= (e.clientY - lastY) * DPR / cam.zoom;
-    lastX = e.clientX; lastY = e.clientY; requestDraw(); return;
+  e.preventDefault();
+  const p = devXY(e); pointers.set(e.pointerId, p);
+  if (pointers.size >= 2) {                               // pinch: zoom + pan anchored to midpoint
+    const cur = pinchState([...pointers.values()]);
+    if (pinchPrev) {
+      const before = screenToWorld(pinchPrev.mx, pinchPrev.my);
+      cam.zoom = clamp(cam.zoom * (cur.dist / pinchPrev.dist), minZoom, maxZoom);
+      const after = screenToWorld(cur.mx, cur.my);
+      cam.x += before.x - after.x; cam.y += before.y - after.y;
+      requestDraw();
+    }
+    pinchPrev = cur; return;
   }
-  if (!meta || lockedNode >= 0) return;
-  pendingMouse = e;
-  if (!hoverRAF) hoverRAF = requestAnimationFrame(() => {
-    hoverRAF = 0;
-    const e2 = pendingMouse, r = canvas.getBoundingClientRect();
-    const w = screenToWorld((e2.clientX - r.left) * DPR, (e2.clientY - r.top) * DPR);
-    setHover(pickAt(w.x, w.y, Math.min(CELL, 16 / cam.zoom)));
-  });
-});
+  if (e.pointerId === panId && panLast) {                 // single-pointer pan
+    cam.x -= (p.x - panLast.x) / cam.zoom;
+    cam.y -= (p.y - panLast.y) / cam.zoom;
+    if (downStart && Math.hypot(p.x - downStart.x, p.y - downStart.y) > 6 * DPR) movedFar = true;
+    panLast = p; requestDraw();
+  }
+}, { passive: false });
+
+function endPointer(e) {
+  try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  const wasSize = pointers.size, wasPan = e.pointerId === panId;
+  pointers.delete(e.pointerId);
+  if (wasSize === 1 && wasPan && !movedFar) tapPick(downStart);   // tap / click = lock cone
+  if (pointers.size === 1) {                              // 2->1: rebase pan to remaining finger
+    const [id, pos] = [...pointers.entries()][0];
+    panId = id; panLast = pos; downStart = pos; movedFar = true; pinchPrev = null;
+  } else if (pointers.size === 0) { panId = -1; panLast = null; pinchPrev = null; }
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
-  const r = canvas.getBoundingClientRect();
-  const sx = (e.clientX - r.left) * DPR, sy = (e.clientY - r.top) * DPR;
-  const before = screenToWorld(sx, sy);
-  const factor = Math.exp(-e.deltaY * 0.0015);
-  cam.zoom = Math.max(minZoom, Math.min(maxZoom, cam.zoom * factor));
-  const after = screenToWorld(sx, sy);
+  const s = devXY(e);
+  const before = screenToWorld(s.x, s.y);
+  cam.zoom = clamp(cam.zoom * Math.exp(-e.deltaY * 0.0015), minZoom, maxZoom);
+  const after = screenToWorld(s.x, s.y);
   cam.x += before.x - after.x; cam.y += before.y - after.y;
   requestDraw();
 }, { passive: false });

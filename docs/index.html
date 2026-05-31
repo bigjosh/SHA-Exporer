@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>SHA-256 circuit explorer</title>
 <style>
   :root {
@@ -18,18 +18,21 @@
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
-    color: var(--text); font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
-  #gl { position: fixed; inset: 0; display: block; width: 100%; height: 100%; touch-action: none; }
+    color: var(--text); font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    -webkit-text-size-adjust: 100%; overscroll-behavior: none; }
+  #gl { position: fixed; inset: 0; display: block; width: 100%; height: 100%;
+    touch-action: none; -webkit-user-select: none; user-select: none; }
 
   .panel { position: fixed; background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px); }
+    border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(6px);
+    max-height: calc(100vh - 24px); overflow: auto; }
 
   #ctrl { top: 12px; left: 12px; width: 340px; }
   #ctrl h1 { margin: 0 0 8px; font-size: 14px; font-weight: 600; letter-spacing: .3px; }
   #ctrl .sub { color: var(--muted); font-size: 11px; margin-bottom: 10px; }
   #ctrl label { display: block; color: var(--muted); font-size: 11px; margin: 8px 0 3px; }
   #msg { width: 100%; background: #0d1320; color: var(--text); border: 1px solid var(--border);
-    border-radius: 6px; padding: 6px 8px; font: inherit; }
+    border-radius: 6px; padding: 8px; font: inherit; }
   #msg:focus { outline: none; border-color: var(--accent); }
   .hashrow { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; }
   #hash { word-break: break-all; font-size: 11px; color: var(--text); }
@@ -59,6 +62,23 @@
     padding: 6px 12px; font-size: 11px; color: var(--muted); display: none; }
   #toast.show { display: block; }
   a { color: var(--accent); }
+
+  /* phone-sized screens: shrink panels, keep the controls and legend from colliding */
+  @media (max-width: 640px) {
+    html, body { font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+    .panel { padding: 7px 9px; border-radius: 7px; }
+    #ctrl { top: 8px; left: 8px; width: auto; max-width: calc(100vw - 116px); }
+    #ctrl h1 { font-size: 12px; margin-bottom: 5px; }
+    #ctrl .sub { display: none; }
+    #ctrl label { margin: 5px 0 3px; }
+    #msg { padding: 9px 8px; }            /* taller tap target */
+    #hash, #stats, #hud { font-size: 10px; }
+    #stats { margin-top: 7px; padding-top: 6px; }
+    #legend { top: 8px; right: 8px; padding: 6px 8px; }
+    #legend .swatch { width: 11px; height: 11px; }
+    #hud { left: 8px; right: 8px; bottom: 8px; width: auto; }
+    #drop .box { padding: 28px 22px; }
+  }
 </style>
 </head>
 <body>
@@ -68,7 +88,7 @@
   <h1>SHA-256 circuit explorer</h1>
   <div class="sub">single 512-bit block · NAND-only · inputs top → hash bottom</div>
   <label for="msg">message (≤ 55 bytes, one block)</label>
-  <input id="msg" value="abc" spellcheck="false" autocomplete="off">
+  <input id="msg" value="abc" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off">
   <div class="hashrow">
     <span id="hash">…</span>
   </div>
@@ -83,9 +103,9 @@
 </div>
 
 <div id="hud" class="panel">
-  <div id="hover"><span class="hint">hover a gate or wire to trace its light-cone</span></div>
+  <div id="hover"><span class="hint">hover or tap a gate to trace its light-cone</span></div>
   <div class="hint" style="margin-top:6px">
-    drag = pan · wheel = zoom · <kbd>click</kbd> lock cone · <kbd>esc</kbd> clear · <kbd>f</kbd> fit · <kbd>w</kbd> wires
+    drag / 1-finger = pan · wheel / pinch = zoom · tap = lock cone · <kbd>esc</kbd> clear · <kbd>f</kbd> fit · <kbd>w</kbd> wires
   </div>
 </div>
 
